@@ -2,16 +2,17 @@ import net from 'net';
 import tls from 'tls';
 import dgram from 'dgram';
 import { ConnectObj, GankServerOpts, tuntype2Str } from './types/index';
-import { Tunnel } from './tunnel';
 import getCustomLogger, { Logger } from './utils/logger';
 import { HeaderTransform, HttpReq } from './stream/header';
 import { getRamdomUUID } from './utils/uuid';
 import { bindStreamSocket, tcpsocketSend } from './utils/socket';
-import GankStream from './stream/gank';
 import { buildIpAddrBuffer, parseIpAddrBuffer } from './utils/ipaddr';
+import { Frame } from './protocol';
+import { doServerHandshake } from './protocol/handshake';
+import { createServerSession, YamuxStream } from './session';
+
 class Server {
     private listenPort: number;
-    private connections: any;
     listenHttpPort: number | undefined;
     listenHttpsPort: number | undefined;
     tlsOpts: { ca: string | undefined; key: string | undefined; cert: string | undefined };
@@ -25,7 +26,6 @@ class Server {
         this.listenHttpPort = opts.httpAddr;
         this.listenHttpsPort = opts.httpsAddr;
         this.serverHost = opts.serverHost || 'gank007.com';
-        this.connections = {};
         this.tlsOpts = {
             ca: opts.tlsCA,
             key: opts.tlsKey,
@@ -37,14 +37,18 @@ class Server {
         this.logger = getCustomLogger('s>', 'debug');
     }
 
-    handleError(conn: any, err: Error) {
-        this.logger.info('err:', err.message);
-    }
-
     releaseConn(conn: ConnectObj) {
         if (conn.server) {
             this.logger.info(`release tunnel unlisten on :${conn.remotePort}`);
-            conn.server.close();
+            // socket 'close' 与 session 'close' 都会触发 releaseConn，置空避免对
+            // dgram socket 二次 close 抛出 ERR_SOCKET_DGRAM_NOT_RUNNING。
+            const server = conn.server;
+            conn.server = undefined;
+            try {
+                server.close();
+            } catch {
+                // already closed
+            }
         }
         const fulldomain = conn.fulldomain;
         if (fulldomain) {
@@ -57,57 +61,62 @@ class Server {
         }
     }
 
-    handleAuth(fm: any) {
-        // console.log('handleAuth:', fm.token);
-        return Promise.resolve('do success!!!');
+    handleAuth(token: string): Promise<string> {
+        // console.log('handleAuth:', token);
+        return Promise.resolve('success');
     }
 
-    async transformSocket(connobj: ConnectObj, socket2: net.Socket) {
+    transformSocket(connobj: ConnectObj, socket2: net.Socket) {
+        if (!connobj.session) {
+            socket2.destroy();
+            return;
+        }
         try {
             this.logger.info(`handle socket for tunnel:${connobj.url}`);
-            const stream = await connobj.tunnel.createStream();
+            const stream = connobj.session.openStream();
             this.logger.info('create stream for', connobj.name);
             socket2.pipe(stream);
             stream.pipe(socket2);
             socket2.on('close', () => stream.destroy());
             socket2.on('error', () => stream.destroy());
             stream.on('close', () => socket2.destroy());
+            stream.on('error', () => socket2.destroy());
         } catch (err) {
             this.logger.info('err:', (err as Error).message);
             socket2.write('service invalid!');
+            socket2.destroy();
         }
     }
 
-    async transformUdpSocket(connobj: ConnectObj, msg: Buffer, rinfo: dgram.RemoteInfo, udpsocket: dgram.Socket) {
+    transformUdpSocket(connobj: ConnectObj, msg: Buffer, rinfo: dgram.RemoteInfo, udpsocket: dgram.Socket) {
         const clientHostPort = `${rinfo.address}:${rinfo.port}`;
         // 只使用一个stream, 避免多次创建
-        if (!connobj.udpstream) {
+        if (!connobj.udpstream && connobj.session) {
             this.logger.info('create stream for', connobj.name);
-            connobj.udpstream = await connobj.tunnel.createStream();
+            const stream = connobj.session.openStream();
+            connobj.udpstream = stream;
             const listenStreamData = (data: Buffer) => {
                 const udpaddrbuf = data.slice(0, 6);
                 const ipaddr = parseIpAddrBuffer(udpaddrbuf);
                 const rawdata = data.slice(6);
-                // console.log('send client===>',rawdata);
-                // send to client
                 udpsocket.send(rawdata, ipaddr.port, ipaddr.addr, (err) => {
                     if (err) {
                         console.log('err;', err);
                     }
                 });
             };
-            const logmsg: any = (err?: Error) => console.log(err || ' stream closed');
-            bindStreamSocket(connobj.udpstream, listenStreamData, logmsg, logmsg);
+            const logmsg: any = (err?: Error) => this.logger.info((err && err.message) || 'udp stream closed');
+            bindStreamSocket(stream as any, listenStreamData, logmsg, logmsg);
         }
+        if (!connobj.udpstream) return;
         this.logger.info(`handle client[udp:${clientHostPort}] packet for tunnel:${connobj.url} msglen:${msg.length}`);
         const stream = connobj.udpstream;
         const udpaddr = buildIpAddrBuffer(rinfo.address, rinfo.port);
         const udppacket = Buffer.concat([udpaddr, msg]);
-
-        tcpsocketSend(stream, udppacket); // udp msg = >stream;
+        tcpsocketSend(stream, udppacket); // udp msg => stream
     }
 
-    handleUdpTunnel(connobj: ConnectObj, fm: any) {
+    handleUdpTunnel(connobj: ConnectObj, fm: Frame): Promise<string> {
         return new Promise((resolve, reject) => {
             const server = dgram.createSocket('udp4');
             server.on('message', (msg: Buffer, rinfo: dgram.RemoteInfo) => {
@@ -118,7 +127,6 @@ class Server {
             });
             server.bind(fm.port, () => {
                 this.logger.info('udp tunnel listen on :' + fm.port);
-                this.logger.info('tunnel listen on :' + fm.port);
                 connobj.server = server;
                 connobj.url = 'udp://' + this.serverHost + ':' + fm.port;
                 connobj.name = fm.name;
@@ -128,16 +136,17 @@ class Server {
         });
     }
 
-    handleTcpTunnel(connobj: ConnectObj, fm: any) {
+    handleTcpTunnel(connobj: ConnectObj, fm: Frame): Promise<string> {
         return new Promise((resolve, reject) => {
             const server = net.createServer((socket2) => this.transformSocket(connobj, socket2));
             server.listen(fm.port, () => {
-                this.logger.info('tcp tunnel listen on :' + fm.port);
+                const addr = server.address();
+                const port = addr && typeof addr === 'object' ? addr.port : (fm.port as number);
+                this.logger.info('tcp tunnel listen on :' + port);
                 connobj.server = server;
-                connobj.url = 'tcp://' + this.serverHost + ':' + fm.port;
-                connobj.server = server;
+                connobj.url = 'tcp://' + this.serverHost + ':' + port;
                 connobj.name = fm.name;
-                connobj.remotePort = fm.port;
+                connobj.remotePort = port;
                 resolve(connobj.url);
             });
             server.on('error', function (err) {
@@ -146,7 +155,7 @@ class Server {
         });
     }
 
-    handleWebTunnel(connobj: ConnectObj, fm: any) {
+    handleWebTunnel(connobj: ConnectObj, fm: Frame): Promise<string> {
         return new Promise((resolve, reject) => {
             if (!fm.subdomain) {
                 const err = Error('subdomain missing');
@@ -170,7 +179,7 @@ class Server {
         });
     }
 
-    handleStcpTunnel(connobj: ConnectObj, fm: any) {
+    handleStcpTunnel(connobj: ConnectObj, fm: Frame): Promise<string> {
         return new Promise((resolve, reject) => {
             if (!fm.secretKey) {
                 const err = Error('secretKey missing');
@@ -189,44 +198,44 @@ class Server {
             connobj.name = fm.name;
             connobj.secretKey = secretKey;
             this.stcpTunnels[secretKey] = connobj;
-            this.handleStcpDispatch(connobj, secretKey);
+            // session 就绪后再监听右端 stream，避免空指针
+            connobj.activate = () => this.handleStcpDispatch(connobj, secretKey);
             resolve(connobj.url);
         });
     }
 
-    handleStcpDispatch(connectObj: ConnectObj, secretKey: string) {
+    handleStcpDispatch(connobj: ConnectObj, secretKey: string) {
         if (!/stcp_right/.test(secretKey)) return;
 
-        const connobj = connectObj;
         const leftkey = secretKey.replace(/stcp_right/, 'stcp_left');
         // dispatch right stcp peer to left stcp peer;
-        const listeStream = async (rightStream: GankStream) => {
+        const listenStream = (rightStream: YamuxStream) => {
             try {
                 const peerConnObj = this.stcpTunnels[leftkey];
-                if (!peerConnObj) {
+                if (!peerConnObj || !peerConnObj.session) {
                     rightStream.destroy();
                     return;
                 }
-                const stream = await peerConnObj.tunnel.createStream();
-                this.logger.info(`create stream for ${connobj.name} to ${peerConnObj.name} ${secretKey}=>${leftkey}`);
-                connobj.tunnel.setReady(rightStream);
+                const stream = peerConnObj.session.openStream();
+                this.logger.info(`create stream for ${connobj.name} ${secretKey}=>${leftkey}`);
                 rightStream.pipe(stream);
                 stream.pipe(rightStream);
                 rightStream.on('close', () => stream.destroy());
                 rightStream.on('error', () => stream.destroy());
                 stream.on('close', () => rightStream.destroy());
+                stream.on('error', () => rightStream.destroy());
             } catch (err) {
                 this.logger.info('err:', (err as Error).message);
-                rightStream.write('service invalid!');
+                rightStream.destroy();
             }
         };
 
-        connobj.tunnel.on('stream', listeStream);
+        connobj.session.on('stream', listenStream);
     }
 
-    handleTunReq(connectObj: ConnectObj, fm: any) {
+    handleTunReq(connectObj: ConnectObj, fm: Frame): Promise<string> {
         this.logger.info('tunnel req:' + JSON.stringify(fm));
-        connectObj.type = tuntype2Str[fm.tunType];
+        connectObj.type = tuntype2Str[fm.tunType as number];
         if (fm.tunType === 0x1) {
             return this.handleTcpTunnel(connectObj, fm);
         } else if (fm.tunType === 0x2) {
@@ -236,52 +245,52 @@ class Server {
         } else if (fm.tunType === 0x4) {
             return this.handleStcpTunnel(connectObj, fm);
         }
+        return Promise.reject(Error('unknown tunnel type'));
     }
 
     handleConection(socket: net.Socket) {
-        const tunnel = new Tunnel(socket);
-        const connectObj: ConnectObj = { tunnel, socket, url: '', rtt: 0 };
+        const connectObj: ConnectObj = { session: undefined as any, socket, url: '', rtt: 0 };
         const cid = getRamdomUUID();
-        this.connectMap[cid] = connectObj;
-        tunnel.registerHandler('auth', this.handleAuth.bind(this));
-        tunnel.registerHandler('tunnel', this.handleTunReq.bind(this, connectObj));
+
+        doServerHandshake(
+            socket,
+            (token: string) => this.handleAuth(token),
+            (frame: Frame) => this.handleTunReq(connectObj, frame)
+        )
+            .then(() => {
+                const session = createServerSession(socket);
+                connectObj.session = session;
+                this.connectMap[cid] = connectObj;
+
+                session.on('error', (err: Error) => this.logger.info('session err:', err.message));
+                session.on('close', () => {
+                    delete this.connectMap[cid];
+                    this.releaseConn(connectObj);
+                });
+
+                if (connectObj.activate) {
+                    connectObj.activate();
+                }
+            })
+            .catch((err: Error) => {
+                this.logger.info('handshake err:', err.message);
+                this.releaseConn(connectObj);
+                socket.destroy();
+            });
+
         socket.on('close', () => {
             delete this.connectMap[cid];
             this.releaseConn(connectObj);
         });
-        tunnel.on('pong', function ({ stime, atime }) {
-            connectObj.rtt = Date.now() - stime;
-            // console.log('===rtt:',connectObj.rtt);
-            // console.log('====>',stime,atime);
-        });
-    }
-
-    keepOnline() {
-        setTimeout(() => {
-            const delList: string[] = [];
-            Object.keys(this.connectMap).forEach((key: string) => {
-                try {
-                    const connobj = this.connectMap[key];
-                    connobj.tunnel.ping();
-                } catch (err) {
-                    delList.push(key);
-                }
-            });
-            delList.forEach((key) => {
-                delete this.connections[key];
-            });
-            this.keepOnline();
-        }, 3000);
+        socket.on('error', (err: Error) => this.logger.info('socket err:', err.message));
     }
 
     handleHttpRequest(socket: net.Socket) {
         const self = this;
-        // console.log('new transform stream===')
         const headerTransformer = new HeaderTransform(transformReq);
         const pipestream = socket.pipe(headerTransformer);
 
         headerTransformer.on('error', function (err: Error) {
-            // console.log('===err:',err);
             socket.write(`HTTP/1.1 200 OK\r\n\r\n${err.message}!`);
             socket.destroy();
         });
@@ -289,8 +298,6 @@ class Server {
         function transformReq(req: HttpReq) {
             let host = req.host;
             host = host.replace(/:\d+$/, '');
-            // this.logger.info('webTunnels:', Object.keys(this.webTunnels));
-            // console.log(Object.keys(self.webTunnels));
             const connobj = self.webTunnels[host];
             if (!connobj) {
                 throw Error('service host missing');
@@ -299,11 +306,12 @@ class Server {
             return req;
         }
 
-        async function handleConn(connobj: ConnectObj, host: string) {
+        function handleConn(connobj: ConnectObj, host: string) {
             try {
-                const tunnel = connobj.tunnel;
-                const stream = await tunnel.createStream();
-                // this.logger.info('create stream for host:', host);
+                if (!connobj.session) {
+                    throw Error('tunnel not ready');
+                }
+                const stream = connobj.session.openStream();
                 self.logger.info('create stream on tunnel:', connobj.name);
                 pipestream.pipe(stream);
                 stream.pipe(socket);
@@ -311,6 +319,7 @@ class Server {
                     self.logger.info('stream close====', host);
                     socket.destroy();
                 });
+                stream.on('error', () => socket.destroy());
                 socket.on('error', function (err) {
                     stream.destroy(err);
                 });
@@ -330,7 +339,6 @@ class Server {
     }
     initTunnelServer() {
         const server = net.createServer(this.handleConection.bind(this));
-        this.keepOnline();
         server.listen(this.listenPort, () => {
             this.logger.info('server listen on 127.0.0.1:' + this.listenPort);
         });

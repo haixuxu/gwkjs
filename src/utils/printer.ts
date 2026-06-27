@@ -6,8 +6,14 @@ let isFirstStatusPrinted = false;
 
 let lastMsg = '';
 
+// In-place status rendering only works on a real terminal. When stdout is a pipe/file
+// (nohup, systemd, pm2, docker without -t, CI), the TTY-only methods are missing and
+// process.stdout.columns is undefined, which previously crashed or spun in an infinite loop.
+const isInteractive = (): boolean =>
+    Boolean(process.stdout.isTTY) && typeof (process.stdout as any).cursorTo === 'function';
+
 function getLastMsgLines() {
-    const columns = process.stdout.columns;
+    const columns = process.stdout.columns || 80;
     const lines = lastMsg.split('\n');
     let count = 0;
     lines.forEach((line: string) => {
@@ -24,6 +30,14 @@ function getLastMsgLines() {
 
 var printer = {
     printStatus(message: string) {
+        if (!isInteractive()) {
+            // Plain, append-only output for non-TTY: skip repaints, only log when changed.
+            if (message !== lastMsg) {
+                process.stdout.write(message + '\n');
+                lastMsg = message;
+            }
+            return;
+        }
         if (!isFirstStatusPrinted) {
             isFirstStatusPrinted = true;
             process.stdout.write('\n');

@@ -1,4 +1,4 @@
-import { Tunnel } from '../tunnel';
+import type { YamuxSession } from '../session';
 
 export const tuntype2Str = ['', 'tcp', 'web', 'udp', 'stcp'];
 
@@ -17,6 +17,7 @@ export interface TunnelOpts {
     remotePort?: number;
     fulldomain?: string;
     status?: string;
+    successMsg?: string;
     secretKey?: string;
     bindIp?: string;
     bindPort?: number;
@@ -45,7 +46,7 @@ export interface GankServerOpts {
 }
 
 export interface ConnectObj {
-    tunnel: Tunnel;
+    session: YamuxSession;
     socket: any;
     rtt: number;
     url: string;
@@ -57,4 +58,6 @@ export interface ConnectObj {
     secretKey?:string;
     // for transport udp data over tcp
     udpstream?:any;
+    // session 就绪后执行（如 stcp 的 stream 分发监听）
+    activate?: () => void;
 }

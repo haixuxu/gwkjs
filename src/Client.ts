@@ -1,30 +1,31 @@
 import net from 'net';
 import dgram from 'dgram';
 import { GankClientOpts, TunnelOpts } from './types/index';
-import { Tunnel } from './tunnel';
 import getCustomLogger, { Logger } from './utils/logger';
 import chalk from 'chalk';
 import printer from './utils/printer';
 import { bindStreamSocket } from './utils/socket';
 import { UdpOverTcpReadStream } from './stream/udp2tcp';
 import { parseIpAddrBuffer } from './utils/ipaddr';
+import { doHandshake } from './protocol/handshake';
+import { createClientSession, YamuxSession, YamuxStream } from './session';
 
 class Client {
     serverHost: string;
     serverPort: number;
+    authToken: string;
     tunnelsMap: Record<string, TunnelOpts>;
     logger: Logger;
     constructor(opts: GankClientOpts) {
         this.serverHost = opts.serverHost;
         this.serverPort = opts.serverPort || 4443;
+        this.authToken = opts.authtoken || 'test:test123';
         this.tunnelsMap = opts.tunnels || {};
         this.logger = getCustomLogger('c>', 'debug');
     }
-    handleUdpStream(tunnel: Tunnel, stream: any) {
-        const tunnelConf = tunnel.opts as TunnelOpts;
-        const successMsg = (tunnel as any).successMsg;
+    handleUdpStream(tunnelConf: TunnelOpts, stream: YamuxStream) {
+        const successMsg = tunnelConf.successMsg as string;
         const localPort = tunnelConf.localPort;
-        // this.updateConsole(tunnelConf, `${successMsg} ${chalk.green('->')}`);
         const udpclientMap = new Map();
         const listenData = (buff: Buffer) => {
             const udpaddrbuf = buff.slice(0, 6);
@@ -40,12 +41,10 @@ class Client {
             }
             const udpcliObj = udpclientMap.get(udpclientAddr);
             udpcliObj.lastAt = Date.now();
-            // console.log('from peer to local udp port:',buff.slice(6), '====localPort',localPort);
-            udpcliObj.udpsocket.send(buff.slice(6), localPort, tunnelConf.localIp, (err: any, len: number) => {
+            udpcliObj.udpsocket.send(buff.slice(6), localPort, tunnelConf.localIp, (err: any) => {
                 if (err) {
                     this.updateConsole(tunnelConf, `${successMsg} ${chalk.red('->|')}`);
-                    // console.log('send err:',err);
-                    stream.emit('error', Error(err.message));
+                    stream.destroy(Error(err.message));
                 } else {
                     this.updateConsole(tunnelConf, `${successMsg} ${chalk.green('<->')}`);
                 }
@@ -54,26 +53,20 @@ class Client {
         const listenError = (err: Error) => {
             this.updateConsole(tunnelConf, `${err.message} ${chalk.red('->|<-')}`);
         };
-        bindStreamSocket(stream, listenData, listenError, () => listenError(Error('stream closed')));
-        tunnel.setReady(stream);
+        bindStreamSocket(stream as any, listenData, listenError, () => listenError(Error('stream closed')));
     }
-    handleTcpStream(tunnel: Tunnel, stream: any) {
-        const tunnelConf = tunnel.opts as TunnelOpts;
-        const successMsg = (tunnel as any).successMsg;
-        // this.logger.info('new stream==== for tunnel:', tunnel.id, JSON.stringify(tunnel.opts));
+    handleTcpStream(tunnelConf: TunnelOpts, stream: YamuxStream) {
+        const successMsg = tunnelConf.successMsg as string;
         const localPort = tunnelConf.localPort;
         this.updateConsole(tunnelConf, `${successMsg} ${chalk.green('->')}`);
         const localsocket = new net.Socket();
         let aborted = false;
-        // this.logger.info('connect 127.0.0.1:' + localPort);
         localsocket.connect(localPort, tunnelConf.localIp, () => {
             if (aborted) return;
             clearTimeout(timeoutid);
-            // this.logger.info('connect ok:', localPort);
             this.updateConsole(tunnelConf, `${successMsg} ${chalk.green('<->')}`);
             stream.pipe(localsocket);
             localsocket.pipe(stream);
-            tunnel.setReady(stream);
         });
         localsocket.on('close', () => {
             this.updateConsole(tunnelConf, successMsg);
@@ -81,6 +74,7 @@ class Client {
         });
         localsocket.on('error', (err) => stream.destroy(err));
         stream.on('close', () => localsocket.destroy());
+        stream.on('error', () => localsocket.destroy());
 
         var timeoutid = setTimeout(() => {
             aborted = true;
@@ -89,22 +83,22 @@ class Client {
         }, 15 * 1000);
     }
 
-    handleStream(tunnel: Tunnel, stream: any) {
-        if (tunnel.opts?.tunType === 0x3) {
-            this.handleUdpStream(tunnel, stream);
+    handleStream(tunnelConf: TunnelOpts, stream: YamuxStream) {
+        if (tunnelConf.tunType === 0x3) {
+            this.handleUdpStream(tunnelConf, stream);
         } else {
-            this.handleTcpStream(tunnel, stream);
+            this.handleTcpStream(tunnelConf, stream);
         }
     }
-    setupStcpBindPort(tunnel: Tunnel, tunnelConf: TunnelOpts) {
+    setupStcpBindPort(session: YamuxSession, tunnelConf: TunnelOpts) {
         const server = net.createServer((socket) => {
-            tunnel.createStream().then((stream) => {
-                socket.pipe(stream);
-                stream.pipe(socket);
-                socket.on('close', () => stream.destroy());
-                socket.on('error', (err) => stream.destroy(err));
-                stream.on('close', () => socket.destroy());
-            });
+            const stream = session.openStream();
+            socket.pipe(stream);
+            stream.pipe(socket);
+            socket.on('close', () => stream.destroy());
+            socket.on('error', (err) => stream.destroy(err));
+            stream.on('close', () => socket.destroy());
+            stream.on('error', () => socket.destroy());
         });
         const hostname: string = tunnelConf.bindIp as string;
         server.listen(tunnelConf.bindPort, hostname, () => {
@@ -118,43 +112,44 @@ class Client {
 
     async setupTunnel(tunnelConf: TunnelOpts) {
         const targetSocket = new net.Socket();
-        // this.logger.info('creating tunnel:', name);
-        // this.logger.info(`connecting ${this.serverHost}:${this.serverPort}`);
         this.updateConsole(tunnelConf, 'connecting');
         targetSocket.connect(this.serverPort, this.serverHost, async () => {
-            // this.logger.info('connect okok');
-            this.updateConsole(tunnelConf, 'connect ok, starting auth');
-            const tunnel = new Tunnel(targetSocket);
-            tunnel.opts = tunnelConf;
-            const msg1 = await tunnel.startAuth('test:test124');
-            this.updateConsole(tunnelConf, 'auth ==>' + msg1);
-            const message = await tunnel.prepareTunnel(tunnelConf);
-            const proto = tunnelConf.tunType === 0x3 ? 'udp' : 'tcp';
-            const localPort = tunnelConf.localPort || tunnelConf.bindPort;
-            const showIp = tunnelConf.bindPort ? tunnelConf.bindIp : tunnelConf.localIp;
-            const successMsg = `${chalk.green('ok')}: ${message} <=> ${proto}://${showIp}:${localPort} ${tunnelConf.bindPort ? 'LISTEN' : ''}`;
-            this.updateConsole(tunnelConf, successMsg);
-            (tunnel as any).successMsg = successMsg;
+            try {
+                this.updateConsole(tunnelConf, 'connect ok, starting auth');
+                const message = await doHandshake(targetSocket, this.authToken, tunnelConf);
 
-            if (tunnelConf.tunType === 0x4 && tunnelConf.bindIp && tunnelConf.bindPort) {
-                // dispatch bindPort stream to stcp peer stream
-                this.setupStcpBindPort(tunnel, tunnelConf);
-            } else {
-                tunnel.on('stream', this.handleStream.bind(this, tunnel));
+                const proto = tunnelConf.tunType === 0x3 ? 'udp' : 'tcp';
+                const localPort = tunnelConf.localPort || tunnelConf.bindPort;
+                const showIp = tunnelConf.bindPort ? tunnelConf.bindIp : tunnelConf.localIp;
+                const successMsg = `${chalk.green('ok')}: ${message} <=> ${proto}://${showIp}:${localPort} ${tunnelConf.bindPort ? 'LISTEN' : ''}`;
+                tunnelConf.successMsg = successMsg;
+                this.updateConsole(tunnelConf, successMsg);
+
+                const session = createClientSession(targetSocket);
+                session.on('error', (err: Error) => {
+                    this.updateConsole(tunnelConf, `tunnel ${chalk.red('err')}:${err.message}`);
+                });
+
+                if (tunnelConf.tunType === 0x4 && tunnelConf.bindIp && tunnelConf.bindPort) {
+                    // stcp_right: 本地监听 bindPort，主动开流到服务端
+                    this.setupStcpBindPort(session, tunnelConf);
+                } else {
+                    // tcp / web / udp / stcp_left: 接收服务端开的流
+                    session.on('stream', (stream: YamuxStream) => this.handleStream(tunnelConf, stream));
+                }
+            } catch (err) {
+                this.updateConsole(tunnelConf, `handshake ${chalk.red('err')}:${(err as Error).message}`);
+                targetSocket.destroy();
             }
-            tunnel.on('error', (err: Error) => {
-                this.updateConsole(tunnelConf, `tunnel ${chalk.red('err')}:${err.message}`);
-            });
         });
         targetSocket.on('error', (err: Error) => {
             this.updateConsole(tunnelConf, err.message);
-            // this.logger.error('connect err:', err.message, ' retrying');
         });
         targetSocket.on('close', () => {
             if (tunnelConf.server) {
                 tunnelConf.server.close(); // release
+                tunnelConf.server = undefined;
             }
-            // this.logger.error('server is closed.');
             setTimeout(() => this.setupTunnel(tunnelConf), 3000);
         });
     }
@@ -172,7 +167,6 @@ class Client {
             message += tunnelConf.name?.padEnd(16) + '';
             message += tunnelConf.status + '\n';
         });
-        // console.log('tunnel===\n'+message);
         printer.printStatus(message);
     }
 

@@ -14,7 +14,9 @@
   ],
   "scripts": {
     "dev": "tsc -w",
-    "build": "rimraf ./lib && tsc"
+    "build": "rimraf ./lib && tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "devDependencies": {
     "@types/node": "^20.4.9",
@@ -24,7 +26,8 @@
     "rimraf": "^5.0.1",
     "ts-node": "^10.9.1",
     "tsx": "^3.12.7",
-    "typescript": "^5.1.5"
+    "typescript": "^5.1.5",
+    "vitest": "^4.1.9"
   },
   "repository": {
     "type": "git",
@@ -38,6 +41,7 @@
   },
   "homepage": "https://github.com/xuxihai123/gwk#readme",
   "dependencies": {
+    "@bbk47/yamux": "^0.1.0",
     "chalk": "4.x",
     "commander": "7.x",
     "string-width": "3.x",
